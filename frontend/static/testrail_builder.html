@@ -184,6 +184,8 @@ textarea { font-family: var(--mono); font-size: 12.5px; resize: vertical; }
 #chat-status-controls input { min-width: 180px; }
 .chat-provider-github { display: none; align-items: center; gap: 8px; flex-wrap: wrap; }
 .chat-provider-github.active { display: flex; }
+.chat-model-wrap { display: flex; align-items: center; gap: 8px; }
+.chat-model-wrap select { min-width: 220px; max-width: 320px; }
 .chat-status-hint { color: var(--text-faint); font-size: 11px; }
 #chat-messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
 #chat-messages:empty::before { content: "Ask about builder actions, TestRail cases, or the Preconditions YAML."; color: var(--text-faint); font-size: 12.5px; }
@@ -405,8 +407,10 @@ select.compact, input.compact { padding: 5px 8px; font-size: 13px; }
               <option value="ollama">Qwen (Ollama)</option>
               <option value="github">Copilot (GitHub PAT)</option>
             </select>
+            <div class="chat-model-wrap">
+              <select id="chat-model" title="Detected model"></select>
+            </div>
             <div id="chat-github-fields" class="chat-provider-github">
-              <input id="chat-github-model" type="text" placeholder="openai/gpt-5-chat" title="GitHub Models model id">
               <input id="chat-github-token" type="password" placeholder="GitHub PAT with models:read" title="GitHub personal access token">
             </div>
           </div>
@@ -719,6 +723,7 @@ const S = {
   chatProvider: "ollama",
   chatGithubModel: "openai/gpt-5-chat",
   chatGithubToken: "",
+  chatAvailableModels: [],
 };
 
 let dragCtx = null;  // {list, fromIndex, card, container, pointerY, rafId} of the step drag in progress, or null
@@ -978,9 +983,9 @@ async function boot() {
   S.chatGithubModel = (chatPrefs && chatPrefs.githubModel) || "openai/gpt-5-chat";
   S.chatGithubToken = (chatPrefs && chatPrefs.githubToken) || "";
   $("#chat-provider").value = S.chatProvider;
-  $("#chat-github-model").value = S.chatGithubModel;
   $("#chat-github-token").value = S.chatGithubToken;
   syncChatProviderUi();
+  await loadChatModels();
   await checkChatStatus();
   S.dirty = saved ? !!saved.dirty : false;
   if (saved && typeof saved.stepsExpanded === "boolean") S.stepsExpanded = saved.stepsExpanded;
@@ -3272,12 +3277,47 @@ async function checkChatStatus() {
   }
 }
 
+async function loadChatModels() {
+  const select = $("#chat-model");
+  select.innerHTML = "";
+  select.appendChild(el("option", { value: "" }, "Loading models..."));
+  select.disabled = true;
+  try {
+    const res = await api("/api/chat/models", {
+      method: "POST",
+      body: {
+        provider: S.chatProvider,
+        github_model: S.chatGithubModel,
+        github_token: S.chatProvider === "github" ? S.chatGithubToken : undefined,
+      },
+    });
+    S.chatAvailableModels = res.models || [];
+    select.innerHTML = "";
+    if (!S.chatAvailableModels.length) {
+      select.appendChild(el("option", { value: "" }, res.message || "No models detected"));
+      select.disabled = true;
+      return;
+    }
+    for (const model of S.chatAvailableModels) {
+      select.appendChild(el("option", { value: model.id }, model.label || model.id));
+    }
+    const selected = res.selected_model || S.chatAvailableModels[0].id;
+    if (S.chatProvider === "github") S.chatGithubModel = selected;
+    select.value = selected;
+    select.disabled = false;
+  } catch (e) {
+    select.innerHTML = "";
+    select.appendChild(el("option", { value: "" }, "Models unavailable"));
+    select.disabled = true;
+  }
+}
+
 function currentChatRequest() {
   return {
     messages: S.chatMessages,
     case_context: currentCaseContext(),
     provider: S.chatProvider,
-    github_model: S.chatGithubModel,
+    github_model: $("#chat-model").value || S.chatGithubModel,
     github_token: S.chatProvider === "github" ? S.chatGithubToken : undefined,
   };
 }
@@ -3370,17 +3410,20 @@ $("#chat-provider").addEventListener("change", async (e) => {
   S.chatProvider = e.target.value;
   syncChatProviderUi();
   saveChatPrefs();
+  await loadChatModels();
   await checkChatStatus();
 });
-$("#chat-github-model").addEventListener("change", async (e) => {
-  S.chatGithubModel = e.target.value.trim() || "openai/gpt-5-chat";
-  e.target.value = S.chatGithubModel;
+$("#chat-model").addEventListener("change", async (e) => {
+  if (S.chatProvider === "github") {
+    S.chatGithubModel = e.target.value || "openai/gpt-5-chat";
+  }
   saveChatPrefs();
   await checkChatStatus();
 });
 $("#chat-github-token").addEventListener("change", async (e) => {
   S.chatGithubToken = e.target.value.trim();
   saveChatPrefs();
+  await loadChatModels();
   await checkChatStatus();
 });
 $("#chat-input").addEventListener("keydown", (e) => {

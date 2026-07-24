@@ -51,6 +51,12 @@ class ChatStatusRequest(BaseModel):
     github_model: Optional[str] = None
 
 
+class ChatModelsRequest(BaseModel):
+    provider: str = "ollama"
+    github_token: Optional[str] = None
+    github_model: Optional[str] = None
+
+
 def _load_framework_doc() -> str:
     sections = (
         "1. Case Naming",
@@ -166,8 +172,29 @@ def _ollama_chat_model() -> str:
     return os.getenv("BUILDER_CHAT_MODEL", "qwen2.5-coder:7b")
 
 
+def _github_token(requested_token: Optional[str]) -> Optional[str]:
+    token = (requested_token or "").strip()
+    if token:
+        return token
+    env_token = os.getenv("GITHUB_TOKEN", "").strip()
+    return env_token or None
+
+
+def _normalize_github_model_id(model: str) -> str:
+    normalized = (model or "").strip()
+    if not normalized:
+        return normalized
+    if "/" in normalized:
+        return normalized
+    openai_prefixes = ("gpt-", "o1", "o3", "o4", "text-embedding-")
+    if normalized.startswith(openai_prefixes):
+        return f"openai/{normalized}"
+    return normalized
+
+
 def _github_chat_model(requested_model: Optional[str]) -> str:
-    return (requested_model or os.getenv("BUILDER_GITHUB_CHAT_MODEL", "openai/gpt-5-chat")).strip()
+    raw = requested_model or os.getenv("BUILDER_GITHUB_CHAT_MODEL", "openai/gpt-5-chat")
+    return _normalize_github_model_id(raw)
 
 
 def _provider_name(raw: Optional[str]) -> str:
@@ -286,12 +313,61 @@ def _http_error_detail(exc: httpx.HTTPError) -> str:
     return str(data)
 
 
+async def _fetch_github_catalog(token: str) -> List[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=12) as client:
+        resp = await client.get(
+            f"{GITHUB_MODELS_BASE_URL}/catalog/models",
+            headers=_github_headers(token),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    return data if isinstance(data, list) else []
+
+
+async def _fetch_ollama_tags() -> List[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=8) as client:
+        resp = await client.get(f"{_ollama_base_url()}/api/tags")
+        resp.raise_for_status()
+        data = resp.json()
+    models = data.get("models") if isinstance(data, dict) else []
+    return models if isinstance(models, list) else []
+
+
+def _github_catalog_to_chat_models(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        outputs = {str(v).lower() for v in (item.get("supported_output_modalities") or [])}
+        inputs = {str(v).lower() for v in (item.get("supported_input_modalities") or [])}
+        if "text" not in outputs or "text" not in inputs:
+            continue
+        if "embedding" in model_id:
+            continue
+        results.append({"id": model_id, "label": model_id})
+    results.sort(key=lambda item: item["id"])
+    return results
+
+
+def _ollama_tags_to_chat_models(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "").strip()
+        if not name:
+            continue
+        results.append({"id": name, "label": name})
+    results.sort(key=lambda item: item["id"])
+    return results
+
+
 async def _ollama_status() -> Dict[str, Any]:
-    base = _ollama_base_url()
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{base}/api/tags")
-            resp.raise_for_status()
+        await _fetch_ollama_tags()
     except httpx.HTTPError:
         return {"configured": False, "provider": "ollama", "model": _ollama_chat_model()}
     except Exception:
@@ -301,6 +377,7 @@ async def _ollama_status() -> Dict[str, Any]:
 
 async def _github_status(token: Optional[str], requested_model: Optional[str]) -> Dict[str, Any]:
     model = _github_chat_model(requested_model)
+    token = _github_token(token)
     if not token:
         return {
             "configured": False,
@@ -309,13 +386,7 @@ async def _github_status(token: Optional[str], requested_model: Optional[str]) -
             "message": "GitHub PAT required",
         }
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(
-                f"{GITHUB_MODELS_BASE_URL}/catalog/models",
-                headers=_github_headers(token),
-            )
-            resp.raise_for_status()
-            models = resp.json()
+        models = await _fetch_github_catalog(token)
     except httpx.HTTPError as exc:
         return {
             "configured": False,
@@ -350,6 +421,74 @@ async def _provider_status(provider: str, token: Optional[str], requested_model:
     if provider == "github":
         return await _github_status(token, requested_model)
     return await _ollama_status()
+
+
+async def _provider_models(provider: str, token: Optional[str], requested_model: Optional[str]) -> Dict[str, Any]:
+    if provider == "github":
+        token = _github_token(token)
+        model = _github_chat_model(requested_model)
+        if not token:
+            return {
+                "configured": False,
+                "provider": "github",
+                "selected_model": model,
+                "models": [],
+                "message": "GitHub PAT required",
+            }
+        try:
+            models = _github_catalog_to_chat_models(await _fetch_github_catalog(token))
+        except httpx.HTTPError as exc:
+            return {
+                "configured": False,
+                "provider": "github",
+                "selected_model": model,
+                "models": [],
+                "message": _http_error_detail(exc),
+            }
+        except Exception as exc:
+            return {
+                "configured": False,
+                "provider": "github",
+                "selected_model": model,
+                "models": [],
+                "message": str(exc),
+            }
+        if model and all(item["id"] != model for item in models):
+            models.insert(0, {"id": model, "label": f"{model} (current)"})
+        return {
+            "configured": True,
+            "provider": "github",
+            "selected_model": model,
+            "models": models,
+        }
+
+    selected = _ollama_chat_model()
+    try:
+        models = _ollama_tags_to_chat_models(await _fetch_ollama_tags())
+    except httpx.HTTPError as exc:
+        return {
+            "configured": False,
+            "provider": "ollama",
+            "selected_model": selected,
+            "models": [],
+            "message": _http_error_detail(exc),
+        }
+    except Exception as exc:
+        return {
+            "configured": False,
+            "provider": "ollama",
+            "selected_model": selected,
+            "models": [],
+            "message": str(exc),
+        }
+    if selected and all(item["id"] != selected for item in models):
+        models.insert(0, {"id": selected, "label": f"{selected} (configured)"})
+    return {
+        "configured": True,
+        "provider": "ollama",
+        "selected_model": selected,
+        "models": models,
+    }
 
 
 async def _call_ollama(
@@ -430,6 +569,7 @@ async def _call_provider(
     tool_defs: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     if provider == "github":
+        token = _github_token(token)
         if not token:
             raise HTTPException(status_code=422, detail="GitHub PAT required for the GitHub provider.")
         return await _call_github(messages, token, requested_model, include_tools, tool_defs)
@@ -454,7 +594,12 @@ def register_chat_routes(
     @app.post("/api/chat/status")
     async def chat_status(req: ChatStatusRequest):
         provider = _provider_name(req.provider)
-        return await _provider_status(provider, (req.github_token or "").strip() or None, req.github_model)
+        return await _provider_status(provider, _github_token(req.github_token), req.github_model)
+
+    @app.post("/api/chat/models")
+    async def chat_models(req: ChatModelsRequest):
+        provider = _provider_name(req.provider)
+        return await _provider_models(provider, req.github_token, req.github_model)
 
     @app.post("/api/chat")
     async def chat(req: ChatRequest):
@@ -475,7 +620,7 @@ def register_chat_routes(
             result = await _call_provider(
                 provider,
                 messages,
-                (req.github_token or "").strip() or None,
+                _github_token(req.github_token),
                 req.github_model,
                 include_tools,
                 tool_defs,
@@ -525,7 +670,7 @@ def register_chat_routes(
         final_result = await _call_provider(
             provider,
             messages,
-            (req.github_token or "").strip() or None,
+            _github_token(req.github_token),
             req.github_model,
             False,
             tool_defs,
