@@ -1,0 +1,47 @@
+name: easybdd-ollama
+
+services:
+  ollama:
+    image: ollama/ollama:${OLLAMA_IMAGE_TAG:-latest}
+    container_name: easybdd-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  model-init:
+    image: ollama/ollama:${OLLAMA_IMAGE_TAG:-latest}
+    container_name: easybdd-ollama-model-init
+    depends_on:
+      - ollama
+    profiles: ["init"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      CRAWLER_AI_MODEL: ${CRAWLER_AI_MODEL:-qwen2.5-coder:7b}
+      BUILDER_CHAT_MODEL: ${BUILDER_CHAT_MODEL:-qwen2.5-coder:7b}
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - |
+        set -e
+        until ollama list >/dev/null 2>&1; do
+          echo "Waiting for ollama service..."
+          sleep 2
+        done
+        ollama pull "$$CRAWLER_AI_MODEL"
+        if [ "$$BUILDER_CHAT_MODEL" != "$$CRAWLER_AI_MODEL" ]; then
+          ollama pull "$$BUILDER_CHAT_MODEL"
+        fi
+
+volumes:
+  ollama_data:
+    name: easybdd_ollama_data

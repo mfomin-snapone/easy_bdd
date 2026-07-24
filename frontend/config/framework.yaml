@@ -1,0 +1,30 @@
+config:
+  api:
+    auth_configs:
+      default:
+        type: none
+    base_urls:
+      development: https://dev-api.example.com
+      production: https://api.example.com
+      staging: https://staging-api.example.com
+    timeout: 30
+    verify_ssl: true
+  browser:
+    default: chrome
+    headless: true
+    timeout: 30
+environments:
+  development:
+    base_url: https://dev.example.com
+    debug: true
+  production:
+    base_url: https://example.com
+    debug: false
+  staging:
+    base_url: https://staging.example.com
+    debug: false
+variables:
+  api_url: https://api.example.com
+  base_url: https://example.com
+  default_timeout: 30
+  test_user_email: test@example.com

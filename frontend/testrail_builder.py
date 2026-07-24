@@ -296,12 +296,16 @@ def _action_reference_markdown() -> str:
     return "\n".join(lines)
 
 
+_FRAMEWORK_DOC_REF = _load_framework_doc()
+_ACTION_REF = _action_reference_markdown()
+
+
 CHAT_SYSTEM_PROMPT = (
     "You are the AI assistant embedded in the Easy BDD TestRail Test Builder. "
     "You help the user author BDD-style TestRail test cases (Var:, Shared:, Setup:, "
     "Teardown:, Feature:), pick the right builder actions, and troubleshoot the "
-    "Preconditions YAML the app generates. Use the framework reference and action "
-    "list below as ground truth — don't invent actions or syntax that aren't in them. "
+    "Preconditions YAML the app generates. Use framework reference and action "
+    "list when provided as ground truth — don't invent actions or syntax that aren't in them. "
     "This model runs on CPU with no GPU, so keep answers short (a few sentences or "
     "a short snippet) — long answers take a long time to generate.\n\n"
     "If the user has a case open in the builder, its title, Preconditions YAML, and "
@@ -311,9 +315,23 @@ CHAT_SYSTEM_PROMPT = (
     "When TestRail access is configured you also have tools: `get_testrail_case` to "
     "read any other case by ID, and `update_testrail_case` to write a title/Preconditions "
     "change directly to TestRail. Only call `update_testrail_case` when the user has "
-    "explicitly asked you to save, apply, or publish a change — never write proactively.\n\n"
-    "# Framework syntax reference\n\n" + _load_framework_doc() + "\n\n"
-    "# Available builder actions (id and required params)\n\n" + _action_reference_markdown()
+    "explicitly asked you to save, apply, or publish a change — never write proactively."
+)
+
+
+CHAT_SYSTEM_PROMPT_FULL = (
+    CHAT_SYSTEM_PROMPT
+    + "\n\n# Framework syntax reference\n\n"
+    + _FRAMEWORK_DOC_REF
+    + "\n\n# Available builder actions (id and required params)\n\n"
+    + _ACTION_REF
+)
+
+
+CHAT_SYSTEM_PROMPT_LIGHT = (
+    CHAT_SYSTEM_PROMPT
+    + "\n\nPerformance mode for early turns: if the request is underspecified, ask one focused "
+      "clarifying question first. Avoid large YAML blocks until requirements are clear."
 )
 
 # Tool schema handed to Ollama for models with function-calling support (qwen2.5-coder
@@ -498,6 +516,54 @@ def _chat_keep_alive() -> str:
     return os.getenv("BUILDER_CHAT_KEEP_ALIVE", "30m")
 
 
+def _chat_lightweight_first_turn_enabled() -> bool:
+    raw = os.getenv("BUILDER_CHAT_LIGHTWEIGHT_FIRST_TURN", "true").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _latest_user_text(messages: List[ChatMessage]) -> str:
+    for msg in reversed(messages or []):
+        if (msg.role or "").strip().lower() == "user":
+            return (msg.content or "").strip()
+    return ""
+
+
+def _looks_detailed_request(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    lower = t.lower()
+    hints = (
+        "feature:", "shared:", "var:", "setup:", "teardown:", "steps:",
+        "selector:", "store_as:", "test.assert", "preconditions",
+        "- browser.", "- api.", "- websocket.", "- telnet.", "- ssh.",
+    )
+    if sum(1 for h in hints if h in lower) >= 2:
+        return True
+    if len(lower.split()) >= 45:
+        return True
+    if len([ln for ln in t.splitlines() if ln.strip()]) >= 5:
+        return True
+    return False
+
+
+def _use_full_prompt_context(req: ChatRequest) -> bool:
+    if not _chat_lightweight_first_turn_enabled():
+        return True
+
+    # Always keep full context when actively editing a case.
+    ctx = req.case_context
+    if ctx and (ctx.case_id or ctx.body or ctx.errors or ctx.warnings):
+        return True
+
+    # After first turn, keep full context for continuity.
+    if len(req.messages or []) > 1:
+        return True
+
+    # One-shot detailed prompts should get full references immediately.
+    return _looks_detailed_request(_latest_user_text(req.messages))
+
+
 @app.get("/api/chat/status")
 async def chat_status():
     base = _ollama_base_url()
@@ -515,7 +581,8 @@ async def chat_status():
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     base = _ollama_base_url()
-    messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+    system_prompt = CHAT_SYSTEM_PROMPT_FULL if _use_full_prompt_context(req) else CHAT_SYSTEM_PROMPT_LIGHT
+    messages = [{"role": "system", "content": system_prompt}]
     case_msg = _case_context_message(req.case_context)
     if case_msg:
         messages.append(case_msg)
