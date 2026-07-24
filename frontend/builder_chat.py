@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -15,9 +16,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 GITHUB_MODELS_BASE_URL = "https://models.github.ai"
 GITHUB_API_VERSION = "2026-03-10"
+GITHUB_CATALOG_CACHE_TTL_SECONDS = 300
 MAX_CHAT_TOOL_ROUNDS = 4
 MAX_CASE_CONTEXT_ISSUES = 8
 MAX_CASE_CONTEXT_BODY_CHARS = 3000
+
+_GITHUB_CATALOG_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 class ChatMessage(BaseModel):
@@ -110,6 +114,38 @@ _CHAT_SYSTEM_PROMPT_BASE = (
 )
 
 
+_CHAT_AUTHORING_RULES = (
+    "\n\nAuthoring rules for this builder:\n"
+    "- When the user asks you to create or refine a test case, default to returning builder-ready Easy BDD output, not generic testing advice.\n"
+    "- Prefer this response structure when drafting: Suggested Case Title, then Preconditions YAML, then 1-3 short next questions or assumptions.\n"
+    "- Preconditions YAML for this builder must use the flush-left Easy BDD format: after `- action:`, put params on following lines with no extra indentation.\n"
+    "- Do not output normally indented YAML under an action unless the user explicitly asks for generic YAML.\n"
+    "- Add `# N. description` comment lines before steps when drafting a case.\n"
+    "- Prefer framework-native assertion actions such as `test.assert_element_visible`, `test.assert_text_contains`, `test.assert_text_equals`, and `test.assert` when they fit better than vague browser checks.\n"
+    "- Prefer stable selectors and user-facing locators. Use role/name, label, or durable selectors when known; avoid brittle selectors when you can.\n"
+    "- If required inputs are missing, ask the smallest useful follow-up question instead of inventing specifics.\n"
+    "- If the user is clearly brainstorming rather than asking for a ready draft, stay concise and ask a focused clarifying question."
+)
+
+
+_CHAT_GUIDED_WORKFLOW = (
+    "\n\nGuided workflow expectations:\n"
+    "- Behave like a guided test-authoring assistant inside the builder, not just a chatbot.\n"
+    "- For browser/UI tests, lead the user step by step: page entry point, critical assertions, interaction steps, expected results, then cleanup if needed.\n"
+    "- When selectors or page details are uncertain, ask for one concrete artifact next: a pasted recording, the visible labels/button text, or the exact element attributes.\n"
+    "- If the user mentions a login page, landing page, wizard, form, or settings screen, propose the smallest sensible first case before expanding into a full suite.\n"
+    "- Keep momentum: after drafting a case, immediately suggest the next missing detail to make it executable in this builder."
+)
+
+
+_CHAT_BROWSER_CAPABILITY_NOTE = (
+    "\n\nBrowser assistance boundaries:\n"
+    "- You can guide browser test authoring, interpret pasted recordings, and refine the currently open case.\n"
+    "- Do not claim that you can directly click or inspect the live browser from this chat unless the user has provided a recording or explicit page details through the builder workflow.\n"
+    "- If live UI details are needed, tell the user exactly what to provide next in the builder context."
+)
+
+
 _CHAT_SYSTEM_PROMPT_TOOLS = (
     " When TestRail access is configured you also have tools: `get_testrail_case` to "
     "read any other case by ID, and `update_testrail_case` to write a title/Preconditions "
@@ -126,7 +162,15 @@ def _chat_system_prompt(provider: str, include_tools: bool) -> str:
         else " Keep answers focused and concise unless the user explicitly asks for a detailed draft."
     )
     tool_note = _CHAT_SYSTEM_PROMPT_TOOLS if include_tools else ""
-    return _CHAT_SYSTEM_PROMPT_BASE + speed_note + "\n\n" + tool_note.strip()
+    return (
+        _CHAT_SYSTEM_PROMPT_BASE
+        + speed_note
+        + _CHAT_AUTHORING_RULES
+        + _CHAT_GUIDED_WORKFLOW
+        + _CHAT_BROWSER_CAPABILITY_NOTE
+        + "\n\n"
+        + tool_note.strip()
+    )
 
 
 def _chat_system_prompt_full(provider: str, include_tools: bool) -> str:
@@ -313,7 +357,42 @@ def _http_error_detail(exc: httpx.HTTPError) -> str:
     return str(data)
 
 
+def _http_error_status(exc: httpx.HTTPError, default: int = 502) -> int:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return default
+    return int(getattr(response, "status_code", default) or default)
+
+
+def _github_catalog_cache_key(token: Optional[str]) -> str:
+    return (token or "").strip()
+
+
+def _get_cached_github_catalog(token: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    key = _github_catalog_cache_key(token)
+    if not key:
+        return None
+    cached = _GITHUB_CATALOG_CACHE.get(key)
+    if not cached:
+        return None
+    if (time.time() - float(cached.get("ts", 0))) > GITHUB_CATALOG_CACHE_TTL_SECONDS:
+        _GITHUB_CATALOG_CACHE.pop(key, None)
+        return None
+    models = cached.get("models")
+    return models if isinstance(models, list) else None
+
+
+def _set_cached_github_catalog(token: Optional[str], models: List[Dict[str, Any]]) -> None:
+    key = _github_catalog_cache_key(token)
+    if not key:
+        return
+    _GITHUB_CATALOG_CACHE[key] = {"ts": time.time(), "models": models}
+
+
 async def _fetch_github_catalog(token: str) -> List[Dict[str, Any]]:
+    cached = _get_cached_github_catalog(token)
+    if cached is not None:
+        return cached
     async with httpx.AsyncClient(timeout=12) as client:
         resp = await client.get(
             f"{GITHUB_MODELS_BASE_URL}/catalog/models",
@@ -321,7 +400,9 @@ async def _fetch_github_catalog(token: str) -> List[Dict[str, Any]]:
         )
         resp.raise_for_status()
         data = resp.json()
-    return data if isinstance(data, list) else []
+    models = data if isinstance(data, list) else []
+    _set_cached_github_catalog(token, models)
+    return models
 
 
 async def _fetch_ollama_tags() -> List[Dict[str, Any]]:
@@ -385,21 +466,13 @@ async def _github_status(token: Optional[str], requested_model: Optional[str]) -
             "model": model,
             "message": "GitHub PAT required",
         }
-    try:
-        models = await _fetch_github_catalog(token)
-    except httpx.HTTPError as exc:
+    models = _get_cached_github_catalog(token)
+    if models is None:
         return {
-            "configured": False,
+            "configured": True,
             "provider": "github",
             "model": model,
-            "message": _http_error_detail(exc),
-        }
-    except Exception as exc:
-        return {
-            "configured": False,
-            "provider": "github",
-            "model": model,
-            "message": str(exc),
+            "message": "GitHub token present. Model list will validate availability.",
         }
     available = {item.get("id") for item in models if isinstance(item, dict)}
     if model not in available:
@@ -552,7 +625,10 @@ async def _call_github(
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="GitHub Models request timed out.") from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"GitHub Models error: {_http_error_detail(exc)}") from exc
+        raise HTTPException(
+            status_code=_http_error_status(exc),
+            detail=f"GitHub Models error: {_http_error_detail(exc)}",
+        ) from exc
     try:
         message = (data.get("choices") or [])[0].get("message", {}) or {}
     except Exception as exc:
