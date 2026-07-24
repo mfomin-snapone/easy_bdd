@@ -37,7 +37,6 @@ try:
 except ImportError:
     pass
 
-import httpx
 import requests
 import yaml
 from fastapi import FastAPI, HTTPException, Query
@@ -71,6 +70,7 @@ from builder_core import (  # noqa: E402
     serialize_case_body,
     validate_case,
 )
+from builder_chat import register_chat_routes  # noqa: E402
 
 app = FastAPI(
     title="Easy BDD TestRail Test Builder",
@@ -110,27 +110,6 @@ class RunRequest(BaseModel):
     name: str
     case_ids: List[int]
     description: Optional[str] = None
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatCaseContext(BaseModel):
-    """The case currently open in the builder editor, sent with every chat
-    turn so the assistant doesn't need the user to paste a case ID it can
-    already see on screen."""
-    case_id: Optional[int] = None
-    title: Optional[str] = None
-    body: Optional[str] = None
-    errors: List[str] = Field(default_factory=list)
-    warnings: List[str] = Field(default_factory=list)
-
-
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
-    case_context: Optional[ChatCaseContext] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -245,95 +224,6 @@ async def get_catalog():
     return {"categories": categories, "case_types": CASE_PREFIXES}
 
 
-# Section headers (verbatim, minus the "## " markdown prefix) to keep from
-# docs/writing-test-cases.md. The full doc runs ~2500 words; on the CPU-only
-# Ollama host this app talks to (~20 tok/s prompt processing, ~5.5 tok/s
-# generation — measured, no GPU), that alone would cost 2+ minutes of prompt
-# processing before the model can even start replying. These sections cover
-# the naming/format/assertion rules that are wrong most often; the full
-# per-action browser table is skipped in favor of the compact CATALOG-derived
-# list below, which already gives per-action required params.
-_FRAMEWORK_DOC_SECTIONS = (
-    "1. Case Naming",
-    "2. Var: Cases",
-    "3. Preconditions Field Format",
-    "6. Assertions",
-    "10. Selector Strategies",
-)
-
-
-def _load_framework_doc() -> str:
-    try:
-        text = (ROOT / "docs" / "writing-test-cases.md").read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    kept = [
-        "## " + section
-        for section in text.split("\n## ")[1:]
-        if section.startswith(_FRAMEWORK_DOC_SECTIONS)
-    ]
-    return "\n\n".join(kept).strip()
-
-
-def _action_reference_markdown() -> str:
-    """Compact action list (id + required params only, no descriptions) grouped
-    by category, generated from the same CATALOG the builder's step palette
-    uses — keeps the assistant's knowledge of available actions in sync with
-    what the UI actually offers, without spending tokens on prose."""
-    by_category: Dict[str, List[str]] = {}
-    for action_id, definition in sorted(CATALOG.items()):
-        params = definition.get("parameters") or {}
-        required = [name for name, cfg in params.items() if cfg.get("required")]
-        entry = f"- `{action_id}`"
-        if required:
-            entry += f" (required: {', '.join(required)})"
-        by_category.setdefault(definition.get("category", "Other"), []).append(entry)
-
-    lines: List[str] = []
-    for category in sorted(by_category):
-        lines.append(f"### {category}")
-        lines.extend(by_category[category])
-    return "\n".join(lines)
-
-
-_FRAMEWORK_DOC_REF = _load_framework_doc()
-_ACTION_REF = _action_reference_markdown()
-
-
-CHAT_SYSTEM_PROMPT = (
-    "You are the AI assistant embedded in the Easy BDD TestRail Test Builder. "
-    "You help the user author BDD-style TestRail test cases (Var:, Shared:, Setup:, "
-    "Teardown:, Feature:), pick the right builder actions, and troubleshoot the "
-    "Preconditions YAML the app generates. Use framework reference and action "
-    "list when provided as ground truth — don't invent actions or syntax that aren't in them. "
-    "This model runs on CPU with no GPU, so keep answers short (a few sentences or "
-    "a short snippet) — long answers take a long time to generate.\n\n"
-    "If the user has a case open in the builder, its title, Preconditions YAML, and "
-    "current validation errors/warnings are provided in a separate 'Currently open "
-    "test case' message on every turn — treat that as ground truth about what they're "
-    "looking at, and don't ask them to paste a case ID that's already given there. "
-    "When TestRail access is configured you also have tools: `get_testrail_case` to "
-    "read any other case by ID, and `update_testrail_case` to write a title/Preconditions "
-    "change directly to TestRail. Only call `update_testrail_case` when the user has "
-    "explicitly asked you to save, apply, or publish a change — never write proactively."
-)
-
-
-CHAT_SYSTEM_PROMPT_FULL = (
-    CHAT_SYSTEM_PROMPT
-    + "\n\n# Framework syntax reference\n\n"
-    + _FRAMEWORK_DOC_REF
-    + "\n\n# Available builder actions (id and required params)\n\n"
-    + _ACTION_REF
-)
-
-
-CHAT_SYSTEM_PROMPT_LIGHT = (
-    CHAT_SYSTEM_PROMPT
-    + "\n\nPerformance mode for early turns: if the request is underspecified, ask one focused "
-      "clarifying question first. Avoid large YAML blocks until requirements are clear."
-)
-
 # Tool schema handed to Ollama for models with function-calling support (qwen2.5-coder
 # does). Kept to exactly the two operations the builder UI itself performs on a case
 # (read one, write title/Preconditions) — same TestRailService + .env credentials the
@@ -386,9 +276,6 @@ TESTRAIL_CHAT_TOOLS = [
     },
 ]
 
-MAX_CHAT_TOOL_ROUNDS = 4
-
-
 def _testrail_configured() -> bool:
     return bool(
         os.getenv("TESTRAIL_URL") and os.getenv("TESTRAIL_USERNAME") and os.getenv("TESTRAIL_API_KEY")
@@ -422,236 +309,12 @@ def _run_chat_tool(name: str, args: Dict[str, Any]) -> str:
         return json.dumps({"error": str(exc)})
 
 
-_TESTRAIL_TOOL_NAMES = {t["function"]["name"] for t in TESTRAIL_CHAT_TOOLS}
-
-
-def _parse_pseudo_tool_call(content: str) -> Optional[tuple]:
-    """qwen2.5-coder:7b (unlike larger tool-tuned models) doesn't reliably
-    populate Ollama's structured `message.tool_calls` — it often writes the
-    call as plain JSON text instead, e.g. {"name": "get_testrail_case",
-    "arguments": {"case_id": 123}}. Detect that shape as a fallback so tool
-    calling still works with this model."""
-    text = (content or "").strip()
-    if not text:
-        return None
-    if text.startswith("```"):
-        text = text.strip("`")
-        if "\n" in text:
-            text = text.split("\n", 1)[1]
-    try:
-        obj = json.loads(text)
-    except ValueError:
-        return None
-    if not isinstance(obj, dict):
-        return None
-    name = obj.get("name")
-    if name not in _TESTRAIL_TOOL_NAMES:
-        return None
-    args = obj.get("arguments", {})
-    if not isinstance(args, dict):
-        return None
-    return name, args
-
-
-# The base system prompt (framework doc + action list) already runs ~3.5k
-# tokens on its own — see the num_ctx comment below. A case with a large
-# Preconditions body or dozens of validation issues (e.g. many duplicate-key
-# warnings) can otherwise inflate the per-turn prompt past what this CPU-only
-# host can process inside one request's timeout, so everything past this
-# cap is dropped rather than sent to the model.
-MAX_CASE_CONTEXT_ISSUES = 8
-MAX_CASE_CONTEXT_BODY_CHARS = 3000
-
-
-def _case_context_message(ctx: Optional[ChatCaseContext]) -> Optional[Dict[str, str]]:
-    if not ctx or not (ctx.case_id or ctx.title or ctx.body):
-        return None
-    lines = ["# Currently open test case in the builder",
-             "(unpublished edits — may not match TestRail yet)"]
-    if ctx.case_id:
-        lines.append(f"TestRail case ID: C{ctx.case_id}")
-    if ctx.title:
-        lines.append(f"Title: {ctx.title}")
-    if ctx.errors:
-        shown = ctx.errors[:MAX_CASE_CONTEXT_ISSUES]
-        suffix = f"\n- ...and {len(ctx.errors) - len(shown)} more" if len(ctx.errors) > len(shown) else ""
-        lines.append("Validation errors:\n" + "\n".join(f"- {e}" for e in shown) + suffix)
-    if ctx.warnings:
-        shown = ctx.warnings[:MAX_CASE_CONTEXT_ISSUES]
-        suffix = f"\n- ...and {len(ctx.warnings) - len(shown)} more" if len(ctx.warnings) > len(shown) else ""
-        lines.append("Validation warnings:\n" + "\n".join(f"- {w}" for w in shown) + suffix)
-    if ctx.body:
-        body = ctx.body
-        if len(body) > MAX_CASE_CONTEXT_BODY_CHARS:
-            body = body[:MAX_CASE_CONTEXT_BODY_CHARS] + f"\n... (truncated, {len(ctx.body)} chars total)"
-        lines.append("Current Preconditions YAML:\n```yaml\n" + body + "\n```")
-    return {"role": "system", "content": "\n\n".join(lines)}
-
-
-def _ollama_base_url() -> str:
-    return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-
-
-def _chat_model() -> str:
-    return os.getenv("BUILDER_CHAT_MODEL", "qwen2.5-coder:7b")
-
-
-def _chat_num_ctx() -> int:
-    # The system prompt (framework doc + action list) alone runs ~3.5k tokens,
-    # and the "currently open case" context message adds more on top of that —
-    # 4096 left almost no headroom and caused real prompts to overflow/stall.
-    return int(os.getenv("BUILDER_CHAT_NUM_CTX", "8192"))
-
-
-def _chat_max_tokens() -> int:
-    # Caps worst-case generation time on the CPU-only host (~5.5 tok/s measured).
-    return int(os.getenv("BUILDER_CHAT_MAX_TOKENS", "350"))
-
-
-def _chat_keep_alive() -> str:
-    # Keep the model resident between turns so a mid-conversation pause doesn't
-    # evict it — that would force reprocessing the whole ~3k-token system
-    # prompt from scratch (~2.5 min) instead of the cached-prefix fast path
-    # (~10-30s, measured) that later turns in the same conversation get.
-    return os.getenv("BUILDER_CHAT_KEEP_ALIVE", "30m")
-
-
-def _chat_lightweight_first_turn_enabled() -> bool:
-    raw = os.getenv("BUILDER_CHAT_LIGHTWEIGHT_FIRST_TURN", "true").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
-
-def _latest_user_text(messages: List[ChatMessage]) -> str:
-    for msg in reversed(messages or []):
-        if (msg.role or "").strip().lower() == "user":
-            return (msg.content or "").strip()
-    return ""
-
-
-def _looks_detailed_request(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    lower = t.lower()
-    hints = (
-        "feature:", "shared:", "var:", "setup:", "teardown:", "steps:",
-        "selector:", "store_as:", "test.assert", "preconditions",
-        "- browser.", "- api.", "- websocket.", "- telnet.", "- ssh.",
-    )
-    if sum(1 for h in hints if h in lower) >= 2:
-        return True
-    if len(lower.split()) >= 45:
-        return True
-    if len([ln for ln in t.splitlines() if ln.strip()]) >= 5:
-        return True
-    return False
-
-
-def _use_full_prompt_context(req: ChatRequest) -> bool:
-    if not _chat_lightweight_first_turn_enabled():
-        return True
-
-    # Always keep full context when actively editing a case.
-    ctx = req.case_context
-    if ctx and (ctx.case_id or ctx.body or ctx.errors or ctx.warnings):
-        return True
-
-    # After first turn, keep full context for continuity.
-    if len(req.messages or []) > 1:
-        return True
-
-    # One-shot detailed prompts should get full references immediately.
-    return _looks_detailed_request(_latest_user_text(req.messages))
-
-
-@app.get("/api/chat/status")
-async def chat_status():
-    base = _ollama_base_url()
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{base}/api/tags")
-            resp.raise_for_status()
-    except httpx.HTTPError:
-        return {"configured": False, "model": _chat_model()}
-    except Exception:
-        return {"configured": False, "model": _chat_model()}
-    return {"configured": True, "model": _chat_model()}
-
-
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
-    base = _ollama_base_url()
-    system_prompt = CHAT_SYSTEM_PROMPT_FULL if _use_full_prompt_context(req) else CHAT_SYSTEM_PROMPT_LIGHT
-    messages = [{"role": "system", "content": system_prompt}]
-    case_msg = _case_context_message(req.case_context)
-    if case_msg:
-        messages.append(case_msg)
-    messages += [{"role": m.role, "content": m.content} for m in req.messages]
-
-    use_tools = _testrail_configured()
-    payload: Dict[str, Any] = {
-        "model": _chat_model(),
-        "stream": False,
-        "keep_alive": _chat_keep_alive(),
-        "options": {
-            "num_ctx": _chat_num_ctx(),
-            "num_predict": _chat_max_tokens(),
-        },
-    }
-    if use_tools:
-        payload["tools"] = TESTRAIL_CHAT_TOOLS
-
-    try:
-        # A single round with a full case-context prompt (~4.5k tokens) has been
-        # measured at ~130s on this CPU-only host; 240s cut it close for the
-        # heaviest real cases (many validation issues + a large body), so this
-        # leaves more headroom. Each round in the tool-call loop gets its own
-        # budget — a multi-round turn can legitimately take several minutes.
-        async with httpx.AsyncClient(timeout=300) as client:
-            for _ in range(MAX_CHAT_TOOL_ROUNDS):
-                resp = await client.post(f"{base}/api/chat", json={**payload, "messages": messages})
-                resp.raise_for_status()
-                data = resp.json()
-                message = data.get("message", {}) or {}
-                tool_calls = list(message.get("tool_calls") or [])
-                pseudo_call = None
-                if not tool_calls and use_tools:
-                    pseudo_call = _parse_pseudo_tool_call(message.get("content", ""))
-                if not tool_calls and not pseudo_call:
-                    return {"reply": message.get("content", "")}
-
-                messages.append(message)
-                if pseudo_call:
-                    name, args = pseudo_call
-                    result = _run_chat_tool(name, args)
-                    messages.append({"role": "tool", "content": result})
-                else:
-                    for call in tool_calls:
-                        fn = call.get("function", {}) or {}
-                        name = fn.get("name", "")
-                        args = fn.get("arguments") or {}
-                        if isinstance(args, str):
-                            try:
-                                args = json.loads(args)
-                            except ValueError:
-                                args = {}
-                        result = _run_chat_tool(name, args)
-                        messages.append({"role": "tool", "content": result})
-            # Ran out of tool-call rounds — ask once more without tools so the
-            # model has to answer in plain text instead of looping forever.
-            final_payload = {k: v for k, v in payload.items() if k != "tools"}
-            resp = await client.post(f"{base}/api/chat", json={**final_payload, "messages": messages})
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=504,
-            detail="Ollama request timed out — the prompt may be too large for this CPU-only "
-                   "host, or the model is busy. Try again, or ask a shorter question.",
-        )
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Ollama error: {exc}")
-    return {"reply": data.get("message", {}).get("content", "")}
+register_chat_routes(
+    app,
+    tool_defs=TESTRAIL_CHAT_TOOLS,
+    tool_runner=_run_chat_tool,
+    tools_available=_testrail_configured,
+)
 
 
 @app.get("/api/testrail/status")

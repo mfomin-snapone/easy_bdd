@@ -82,6 +82,7 @@ from builder_core import (  # noqa: E402
     serialize_case_body,
     validate_case,
 )
+from builder_chat import register_chat_routes  # noqa: E402
 
 app = FastAPI(
     title="Easy BDD Local Test Builder",
@@ -104,6 +105,8 @@ TESTS_DIR.mkdir(parents=True, exist_ok=True)
 
 RUNS_DIR = Path(os.getenv("LOCAL_BUILDER_RUNS_DIR", str(ROOT / "reports" / "local_runs"))).resolve()
 RUN_STORE = LocalRunStore(RUNS_DIR)
+
+register_chat_routes(app)
 
 # Case files carry a `role:` key limited to these — Var:/Shared: never
 # materialize as case files (see module docstring).
