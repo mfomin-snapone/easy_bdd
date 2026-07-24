@@ -683,6 +683,7 @@ select.compact, input.compact { padding: 5px 8px; font-size: 13px; }
     </div>
     <div class="modal-foot">
       <button class="btn" data-close="import-back">Cancel</button>
+      <button class="btn ghost" id="btn-import-assist" disabled>Ask assistant</button>
       <button class="btn primary" id="btn-import-add" disabled>Add steps</button>
     </div>
   </div>
@@ -3135,8 +3136,11 @@ function openImportModal() {
   $("#import-text").value = "";
   $("#import-result").innerHTML = "";
   const add = $("#btn-import-add");
+  const assist = $("#btn-import-assist");
   add.disabled = true;
   add.textContent = "Add steps";
+  assist.disabled = true;
+  assist.textContent = "Ask assistant";
   $("#import-back").classList.add("open");
   $("#import-text").focus();
 }
@@ -3177,9 +3181,12 @@ async function previewImport() {
   const text = $("#import-text").value.trim();
   const box = $("#import-result");
   const add = $("#btn-import-add");
+  const assist = $("#btn-import-assist");
   importResult = null;
   add.disabled = true;
   add.textContent = "Add steps";
+  assist.disabled = true;
+  assist.textContent = "Ask assistant";
   if (!text) { box.innerHTML = ""; return; }
   try {
     const r = await api("/api/import/recording", { method: "POST", body: {
@@ -3189,10 +3196,45 @@ async function previewImport() {
     renderImportResult(r);
     add.disabled = false;
     add.textContent = `Add ${r.steps.length} step${r.steps.length === 1 ? "" : "s"}`;
+    assist.disabled = false;
+    assist.textContent = "Ask assistant";
   } catch (e) {
     box.innerHTML = "";
     box.appendChild(el("div", { style: "color: var(--red, #e5484d); font-size:12.5px" }, e.message));
   }
+}
+
+function recordingAssistantPrompt(result) {
+  const summaries = (result.steps || []).map((node, idx) => {
+    const s = stepSummary(node);
+    return `${idx + 1}. ${s.label}${s.detail ? ` — ${s.detail}` : ""}`;
+  }).join("\n");
+  const vars = (result.variables || []).map((v) => `${v.key}=${v.value}`).join("\n");
+  const currentName = ($("#case-name").value || "").trim();
+  return [
+    "Use this imported browser recording to help me author a builder-ready Easy BDD case.",
+    currentName ? `Current case name in the builder: ${currentName}` : "No case name is set yet.",
+    `Detected recording format: ${result.format}`,
+    result.name ? `Recorder-suggested name: ${result.name}` : "",
+    result.warnings && result.warnings.length ? `Conversion warnings:\n${result.warnings.map((w) => `- ${w}`).join("\n")}` : "",
+    vars ? `Variables discovered:\n${vars}` : "",
+    `Converted steps:\n${summaries}`,
+    "Please do all of the following:",
+    "1. Propose the best Easy BDD case title.",
+    "2. Produce builder-ready flush-left Preconditions YAML.",
+    "3. Point out any brittle selectors or missing assertions.",
+    "4. Ask me only the next missing detail needed to make this executable.",
+  ].filter(Boolean).join("\n\n");
+}
+
+async function askAssistantFromImport() {
+  if (!importResult || S.chatBusy) return;
+  const text = recordingAssistantPrompt(importResult);
+  $("#import-back").classList.remove("open");
+  switchTab("chat");
+  S.chatMessages.push({ role: "user", content: text });
+  renderChatMessage("user", text);
+  await submitChatTurn();
 }
 
 function scheduleImportPreview() {
@@ -3234,6 +3276,7 @@ $("#btn-import-add").addEventListener("click", () => {
   $("#import-back").classList.remove("open");
   toast(`Imported ${importResult.steps.length} steps (${importResult.format}).`, "ok");
 });
+$("#btn-import-assist").addEventListener("click", askAssistantFromImport);
 document.querySelectorAll("[data-close]").forEach(b =>
   b.addEventListener("click", () => $("#" + b.dataset.close).classList.remove("open")));
 document.querySelectorAll(".modal-back").forEach(m =>
