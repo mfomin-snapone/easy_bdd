@@ -43,43 +43,67 @@ the STDIO/SSE server only starts when `serve()` is called explicitly from
 the CLI entrypoint, which the builder apps never call).
 
 ```python
+import asyncio
+
 from easybdd.mcp_server import mcp
 
-async def list_mcp_tool_defs() -> list[dict]:
+def list_mcp_tool_defs() -> list[dict]:
     """OpenAI/Ollama-style tool schemas for every registered MCP tool."""
-    tools = await mcp.list_tools()
     return [
         {
             "type": "function",
             "function": {
-                "name": t.name,
-                "description": t.description or "",
-                "parameters": t.inputSchema,
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.parameters,
             },
         }
-        for t in tools
+        for tool in mcp._tool_manager.list_tools()
     ]
 
 async def run_mcp_tool(name: str, args: dict) -> str:
     """Invoke an MCP tool by name and return a JSON-string-safe result."""
-    result = await mcp.call_tool(name, args)
-    return _stringify(result)
+    result = await asyncio.to_thread(asyncio.run, mcp.call_tool(name, args))
+    return _stringify_tool_result(result)
 ```
 
-`_stringify` normalizes whatever `call_tool` returns (a list of MCP content
-blocks, most commonly `TextContent` items, or occasionally a plain dict) into
-a single string: join `.text` from content blocks, or `json.dumps` a dict.
+Note: this is sync (not `async def`) and reads `mcp._tool_manager.list_tools()`
+with `tool.parameters` — the currently-private `FastMCP` tool-manager API —
+rather than the public `await mcp.list_tools()` / `t.inputSchema`. This was a
+deliberate implementation choice (the private API returns the richer `Tool`
+objects with `.parameters` directly usable as the OpenAI schema), but it means
+this call could break on an `mcp` package upgrade that changes or removes
+`_tool_manager`.
 
-`list_mcp_tool_defs()`'s result is computed once per process (module-level
-cache) — the registered tool set doesn't change at runtime.
+`call_tool()` actually returns a `(content_blocks, structured_dict) 2-tuple`
+for every tool here (all 20 are annotated `-> str`, so FastMCP always attaches
+an output schema). `_stringify_tool_result` prefers the structured side:
+functions returning a plain string are wrapped by FastMCP as
+`{"result": "..."}`, which is unwrapped back to the plain string; anything
+else is re-serialized with `json.dumps`. The list/tuple-of-content-blocks and
+plain-dict branches are kept as a fallback for any other shape `call_tool`
+might return.
+
+`run_mcp_tool` also drives the whole `call_tool(...)` coroutine via
+`asyncio.to_thread(asyncio.run, ...)` rather than awaiting it directly: 19 of
+the 20 tools are plain sync `def`s that `call_tool` would otherwise execute
+inline on the caller's event loop, and both builder apps are long-lived
+single-event-loop FastAPI processes, so a slow sync tool would freeze the
+process for every user. Running the coroutine to completion on a separate
+thread (which has no event loop of its own, so the nested `asyncio.run` does
+not conflict with the caller's loop) avoids that.
+
+`list_mcp_tool_defs()` has no module-level cache; it's called once per
+process at import time by each builder app, so the registered tool set is
+computed only once regardless.
 
 ### Wiring into `testrail_builder.py` and `local_builder.py`
 
 Each app already builds its own hand-written `TESTRAIL_CHAT_TOOLS` /
 `_run_chat_tool` (or local-builder equivalent) for its two app-specific
-tools. Each app now also computes `await list_mcp_tool_defs()` once at
-startup and concatenates it onto its hand-written tool list before passing
-to `register_chat_routes`.
+tools. Each app now also computes `list_mcp_tool_defs()` once at import time
+and concatenates it onto its hand-written tool list before passing to
+`register_chat_routes`.
 
 Dispatch becomes a combined async function per app:
 

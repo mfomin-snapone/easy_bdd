@@ -672,6 +672,8 @@ async def _invoke_tool_runner(
     output = tool_runner(name, args)
     if inspect.isawaitable(output):
         output = await output
+    if not isinstance(output, str):
+        output = json.dumps(output)
     return output
 
 
