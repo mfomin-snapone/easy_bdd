@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import time
@@ -652,11 +653,30 @@ async def _call_provider(
     return await _call_ollama(messages, include_tools, tool_defs)
 
 
+async def _invoke_tool_runner(
+    tool_runner: Optional[Callable[[str, Dict[str, Any]], Any]],
+    name: str,
+    args: Dict[str, Any],
+) -> str:
+    """Call tool_runner, awaiting the result if it's a coroutine.
+
+    Lets register_chat_routes accept either a synchronous tool_runner (the
+    hand-written per-app tools) or an async one (MCP-tool dispatch, since
+    some MCP tools like crawl_device are async def).
+    """
+    if not tool_runner:
+        return json.dumps({"error": "Tool runner unavailable."})
+    output = tool_runner(name, args)
+    if inspect.isawaitable(output):
+        output = await output
+    return output
+
+
 def register_chat_routes(
     app: FastAPI,
     *,
     tool_defs: Optional[List[Dict[str, Any]]] = None,
-    tool_runner: Optional[Callable[[str, Dict[str, Any]], str]] = None,
+    tool_runner: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
     tools_available: Optional[Callable[[], bool]] = None,
 ) -> None:
     tool_defs = tool_defs or []
@@ -721,7 +741,7 @@ def register_chat_routes(
 
             if pseudo_call:
                 name, args = pseudo_call
-                output = tool_runner(name, args) if tool_runner else json.dumps({"error": "Tool runner unavailable."})
+                output = await _invoke_tool_runner(tool_runner, name, args)
                 messages.append({"role": "tool", "content": output})
                 continue
 
@@ -734,7 +754,7 @@ def register_chat_routes(
                         args = json.loads(args)
                     except ValueError:
                         args = {}
-                output = tool_runner(name, args) if tool_runner else json.dumps({"error": "Tool runner unavailable."})
+                output = await _invoke_tool_runner(tool_runner, name, args)
                 tool_message = {"role": "tool", "content": output}
                 if provider == "github":
                     if call.get("id"):
