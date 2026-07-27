@@ -154,7 +154,16 @@ _CHAT_SYSTEM_PROMPT_TOOLS = (
     "improving test cases with Ollama, and writing/pushing cases to TestRail. Only "
     "perform a real write, run, push, or crawl when the user has explicitly asked you "
     "to save, apply, run, or publish something; never do so proactively. Prefer "
-    "read-only or preview/dry-run tools first when you're unsure."
+    "read-only or preview/dry-run tools first when you're unsure.\n\n"
+    "Never call a tool with a made-up value for a required parameter (URL, "
+    "username, password, project ID, case ID, file path, or anything else). "
+    "Example values shown in a tool's own description (e.g. 'https://192.168.100.145' "
+    "or 'admin') are illustrations of the expected format, never real arguments -- "
+    "do not copy them into a call. If you don't have a value the user hasn't given "
+    "you, ask for it in plain conversation before calling the tool; if several "
+    "required values are missing, ask for them one at a time rather than guessing "
+    "or asking for all of them at once. Only call the tool once every required "
+    "value has actually come from the user."
 )
 
 
