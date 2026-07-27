@@ -71,6 +71,7 @@ from builder_core import (  # noqa: E402
     validate_case,
 )
 from builder_chat import register_chat_routes  # noqa: E402
+from mcp_tool_bridge import list_mcp_tool_defs, run_mcp_tool  # noqa: E402
 
 app = FastAPI(
     title="Easy BDD TestRail Test Builder",
@@ -276,15 +277,11 @@ TESTRAIL_CHAT_TOOLS = [
     },
 ]
 
-def _testrail_configured() -> bool:
-    return bool(
-        os.getenv("TESTRAIL_URL") and os.getenv("TESTRAIL_USERNAME") and os.getenv("TESTRAIL_API_KEY")
-    )
-
-
-def _run_chat_tool(name: str, args: Dict[str, Any]) -> str:
+async def _run_chat_tool(name: str, args: Dict[str, Any]) -> str:
     """Execute a tool call the chat model requested, returning a JSON string
-    (never raises — errors are reported back to the model as tool output)."""
+    (never raises — errors are reported back to the model as tool output).
+    Falls through to the full MCP toolset (frontend/mcp_tool_bridge.py) for
+    any name that isn't one of this app's two hand-written tools."""
     try:
         if name == "get_testrail_case":
             case_id = int(args["case_id"])
@@ -302,18 +299,19 @@ def _run_chat_tool(name: str, args: Dict[str, Any]) -> str:
                 return json.dumps({"error": "Nothing to update — provide title and/or preconditions."})
             case = _tr().update_case(case_id, **payload)
             return json.dumps({"ok": True, "case_id": case_id, "title": case.get("title", "")})
-        return json.dumps({"error": f"Unknown tool '{name}'"})
+        return await run_mcp_tool(name, args)
     except TestRailError as exc:
         return json.dumps({"error": f"TestRail error: {exc}"})
     except Exception as exc:  # noqa: BLE001 - reported to the model, not raised
         return json.dumps({"error": str(exc)})
 
 
+ALL_CHAT_TOOLS = TESTRAIL_CHAT_TOOLS + list_mcp_tool_defs()
+
 register_chat_routes(
     app,
-    tool_defs=TESTRAIL_CHAT_TOOLS,
+    tool_defs=ALL_CHAT_TOOLS,
     tool_runner=_run_chat_tool,
-    tools_available=_testrail_configured,
 )
 
 
