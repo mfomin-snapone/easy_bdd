@@ -622,11 +622,22 @@ class TestRailRunner:
 
         # Single datalake post for the entire run (skipped if --no-datalake)
         if not no_datalake:
-            # Pre-extract product metadata from the first Feature/Test case
+            # Var: cases are the source of truth for per-SKU runs. Start with
+            # those shared variables, then retain inline case metadata as a
+            # fallback for older runs that do not define a Var: case.
             _product = "Unknown"
             _product_category = "Test"
             _mac_address = "00:00:00:00:00:00"
             _time_savings = 5.0
+            _run_metadata = self._extract_vars(classified)
+            _product = _run_metadata.get("product", _product)
+            _product_category = _run_metadata.get(
+                "product_category", _product_category
+            )
+            _mac_address = _run_metadata.get(
+                "mac_address", _run_metadata.get("mac", _mac_address)
+            )
+            _time_savings = _run_metadata.get("time_savings", _time_savings)
             for _case in classified:
                 if _case.get("role") in ("inline", "test"):
                     _body = _get_case_body(_case)
@@ -634,10 +645,24 @@ class TestRailRunner:
                         _parsed = _yaml_safe_load_lenient(_body) if _body else None
                         if isinstance(_parsed, dict):
                             _v = _parsed.get("variables") or {}
-                            _product = _v.get("product", _product)
-                            _product_category = _v.get("product_category", _product_category)
-                            _mac_address = _v.get("mac_address") or _v.get("mac") or _mac_address
-                            _time_savings = float(_v.get("time_savings", _time_savings))
+                            if "product" not in _run_metadata:
+                                _product = _v.get("product", _product)
+                            if "product_category" not in _run_metadata:
+                                _product_category = _v.get(
+                                    "product_category", _product_category
+                                )
+                            if not any(
+                                key in _run_metadata for key in ("mac_address", "mac")
+                            ):
+                                _mac_address = (
+                                    _v.get("mac_address")
+                                    or _v.get("mac")
+                                    or _mac_address
+                                )
+                            if "time_savings" not in _run_metadata:
+                                _time_savings = float(
+                                    _v.get("time_savings", _time_savings)
+                                )
                     except Exception:
                         pass
                     break
