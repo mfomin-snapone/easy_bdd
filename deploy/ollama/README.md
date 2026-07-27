@@ -41,7 +41,9 @@ docker compose --profile init run --rm model-init
 Recommended baseline (CPU-friendly):
 
 - `qwen2.5-coder:7b` for crawler + MCP tools
-- `qwen2.5-coder:7b` (or a stronger chat model) for builder chat
+- `qwen2.5-coder:3b` for builder chat — 3b keeps tool-calling support while being
+  meaningfully faster/lighter than 7b on a CPU-only host; below 3b, tool-call
+  argument fidelity degrades too much for a chat assistant that calls tools
 
 ## 4) Set EasyBDD env vars
 
@@ -56,8 +58,8 @@ OLLAMA_NUM_CTX=4096
 OLLAMA_TIMEOUT=1200
 OLLAMA_MAX_SNAPSHOT_CHARS=12000
 
-BUILDER_CHAT_MODEL=qwen2.5-coder:7b
-BUILDER_CHAT_NUM_CTX=8192
+BUILDER_CHAT_MODEL=qwen2.5-coder:3b
+BUILDER_CHAT_NUM_CTX=4096
 BUILDER_CHAT_MAX_TOKENS=350
 BUILDER_CHAT_KEEP_ALIVE=30m
 ```
