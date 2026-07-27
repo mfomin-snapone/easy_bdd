@@ -196,7 +196,10 @@ def _chat_system_prompt_light(provider: str, include_tools: bool) -> str:
 
 
 def _chat_num_ctx() -> int:
-    return int(os.getenv("BUILDER_CHAT_NUM_CTX", "8192"))
+    # Lowered from 8192: this CPU-only host pays prefill cost proportional to
+    # context size on every turn, and the builder chat's own conversations
+    # (a few short messages plus the current case body) don't need 8k.
+    return int(os.getenv("BUILDER_CHAT_NUM_CTX", "4096"))
 
 
 def _chat_max_tokens() -> int:

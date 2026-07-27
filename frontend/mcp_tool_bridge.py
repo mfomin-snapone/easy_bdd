@@ -12,9 +12,38 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any, Dict, List
 
 from easybdd.mcp_server import mcp
+
+_MAX_SHORT_DESCRIPTION_CHARS = 200
+_PARAMETERS_HEADER_RE = re.compile(r"(?:\A|\n)\s*Parameters\s*\n\s*-+")
+
+
+def _short_description(description: str) -> str:
+    """Summary of a tool's docstring, whitespace-collapsed, capped in length.
+
+    Full MCP docstrings include a "Parameters" section aimed at another LLM
+    reading a tool spec once; sending all of that on every chat turn to a
+    CPU-only Ollama host adds real, measured prefill latency for text the
+    model doesn't need to pick the right tool. A short summary is enough.
+    Cuts at a numpydoc-style "Parameters\\n----------" header if present
+    (with or without a blank line before it -- some docstrings, e.g.
+    crawl_device's, have no summary line and start directly with it, which
+    would otherwise defeat a plain blank-line split). Falls back to a hard
+    character cap so no description is ever unbounded.
+    """
+    text = description.strip()
+    match = _PARAMETERS_HEADER_RE.search(text)
+    summary = text[: match.start()] if match else text.split("\n\n", 1)[0]
+    summary = " ".join(summary.split())
+    if not summary:
+        # No summary line before the Parameters header (e.g. crawl_device) --
+        # fall back to the full docstring rather than shipping an empty
+        # description, still bounded by the char cap below.
+        summary = " ".join(text.split())
+    return summary[:_MAX_SHORT_DESCRIPTION_CHARS].rstrip()
 
 
 def list_mcp_tool_defs() -> List[Dict[str, Any]]:
@@ -24,7 +53,7 @@ def list_mcp_tool_defs() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": tool.name,
-                "description": tool.description or "",
+                "description": _short_description(tool.description or ""),
                 "parameters": tool.parameters,
             },
         }
