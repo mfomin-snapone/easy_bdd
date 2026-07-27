@@ -6,6 +6,7 @@ tool names to the MCP bridge instead of returning "Unknown tool".
 """
 
 import asyncio
+import json
 
 from frontend.mcp_tool_bridge import list_mcp_tool_defs
 from frontend.testrail_builder import ALL_CHAT_TOOLS, TESTRAIL_CHAT_TOOLS, _run_chat_tool
@@ -19,6 +20,7 @@ def test_all_chat_tools_includes_hand_written_and_mcp_tools():
     assert hand_written_names <= names
     assert mcp_names <= names
     assert names == hand_written_names | mcp_names
+    assert len(ALL_CHAT_TOOLS) == len(names)
 
 
 def test_run_chat_tool_dispatches_mcp_only_tool_by_name():
@@ -26,6 +28,9 @@ def test_run_chat_tool_dispatches_mcp_only_tool_by_name():
     assert isinstance(result, str)
     assert result.strip() != ""
     assert "Unknown tool" not in result
+    parsed = json.loads(result)
+    assert isinstance(parsed, list)
+    assert "TextContent(" not in result
 
 
 def test_run_chat_tool_still_reports_unknown_tool_for_bogus_name():

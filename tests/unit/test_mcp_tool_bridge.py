@@ -8,6 +8,7 @@ of hand-written ones.
 """
 
 import asyncio
+import json
 
 from easybdd.mcp_server import mcp
 from frontend.mcp_tool_bridge import list_mcp_tool_defs, run_mcp_tool
@@ -36,6 +37,9 @@ def test_run_mcp_tool_invokes_real_tool_and_returns_text():
     result = asyncio.run(run_mcp_tool("list_tests", {"path": "tests/cases"}))
     assert isinstance(result, str)
     assert result.strip() != ""
+    parsed = json.loads(result)
+    assert isinstance(parsed, list)
+    assert "TextContent(" not in result
 
 
 def test_run_mcp_tool_unknown_tool_returns_error_not_exception():
