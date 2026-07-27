@@ -121,31 +121,23 @@ Open `http://localhost:8091`. Requires the same `TESTRAIL_URL` / `TESTRAIL_USERN
 Use it to browse runs, mark tests for retest, and edit cases without hand-writing YAML
 in the TestRail web UI.
 
-### Production instance
+### Production instance (disabled — kept for reference)
 
-The builder also runs persistently on the main Jenkins server
-(`<jenkins_url>`) as a systemd service, so nobody needs to run it locally —
-just open **<jenkins_url>:8091**.
+**As of July 2026 this no longer runs on the Jenkins server.** The systemd
+service was stopped and disabled — along with its sibling
+`easybdd-local-builder` (port 9093) — and the Jenkinsfile no longer
+restarts either on deploy. `<jenkins_url>:8091` will not respond. Run the
+builder locally (step above) if you need it; the unit files and app code
+below are kept only as a reference for standing up a similar service.
 
-- Service unit: `/etc/systemd/system/easybdd-testrail-builder.service`
-- Runs from `/home/jenkins/EasyBDD/frontend`, as the `jenkins` user
-- Loads TestRail credentials from `/home/jenkins/EasyBDD/.env`
-- Enabled at boot (`systemctl enable`) and auto-restarts on failure
+- Service unit (still on disk, `disabled`/`inactive`):
+  `/etc/systemd/system/easybdd-testrail-builder.service`
+- Ran from `/home/jenkins/EasyBDD/frontend`, as the `jenkins` user
+- Loaded TestRail credentials from `/home/jenkins/EasyBDD/.env`
 
-New code is picked up automatically: pushing to `main` triggers the
-`EasyBDD` Jenkins deploy job, which pulls into `/home/jenkins/EasyBDD` and
-restarts the service. To restart manually:
-
-```bash
-sudo systemctl restart easybdd-testrail-builder
-```
-
-Check status / logs:
-
-```bash
-sudo systemctl status easybdd-testrail-builder
-journalctl -u easybdd-testrail-builder -f
-```
+To re-enable (not expected to be needed): `sudo systemctl enable --now
+easybdd-testrail-builder` and re-add its `systemctl restart` line to the
+root `Jenkinsfile`'s "Restart services" stage.
 
 ### Browsing Floci buckets (web UI)
 
