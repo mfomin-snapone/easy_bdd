@@ -80,8 +80,6 @@ pipeline {
             steps {
                 sh '''
                     echo "Restarting dependent services with updated code..."
-                    sudo systemctl restart easybdd-testrail-builder || true
-                    sudo systemctl restart easybdd-local-builder || true
                     sudo systemctl restart easy-bdd-mcp || true
                 '''
             }
