@@ -148,10 +148,13 @@ _CHAT_BROWSER_CAPABILITY_NOTE = (
 
 
 _CHAT_SYSTEM_PROMPT_TOOLS = (
-    " When TestRail access is configured you also have tools: `get_testrail_case` to "
-    "read any other case by ID, and `update_testrail_case` to write a title/Preconditions "
-    "change directly to TestRail. Only call `update_testrail_case` when the user has "
-    "explicitly asked you to save, apply, or publish a change; never write proactively."
+    " You have tools available covering: reading and looking up TestRail cases and "
+    "Easy BDD test files, validating and running tests, inspecting failure traces and "
+    "previewing/applying fixes, crawling a device to generate tests, generating or "
+    "improving test cases with Ollama, and writing/pushing cases to TestRail. Only "
+    "perform a real write, run, push, or crawl when the user has explicitly asked you "
+    "to save, apply, run, or publish something; never do so proactively. Prefer "
+    "read-only or preview/dry-run tools first when you're unsure."
 )
 
 
